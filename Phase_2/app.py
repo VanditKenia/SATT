@@ -3,11 +3,10 @@ app.py -- interactive demo for SATT (Slice-Aware Temporal Tokenization).
 
 A scrolling, step-by-step page:
     1. Upload a CT scan (.nii.gz)
-    2. 3D view of the scan (rotate / zoom)
-    3. 2D slice browser (axial, coronal, sagittal)
-    4. What the model sees: 64 slices grouped into 16 chunks of 4
-    5. Generate the report with the SATT model
-    6. How SATT works, results and limitations
+    2. 2D slice browser (axial, coronal, sagittal)
+    3. What the model sees: 64 slices grouped into 16 chunks of 4
+    4. Generate the report with the SATT model
+    5. How SATT works, results and limitations
 
 Research prototype. NOT a medical device and not for clinical use.
 
@@ -15,9 +14,6 @@ Run from Phase_2/ (same folder as inference.py, model.py, eval_paths.py):
     HF_HUB_OFFLINE=1 python app.py
 The browser opens at http://127.0.0.1:7860 once the model has loaded
 (about a minute).
-
-The 3D view needs plotly and scikit-image; without them the rest of the app
-still works and the 3D section says what is missing.
 """
 
 import os
@@ -35,16 +31,8 @@ import nibabel as nib
 import pandas as pd
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
-from scipy import ndimage
 
 from inference import SATTInference, DISCLAIMER, HU_MIN, HU_MAX, compare_with_saved
-
-try:                                    # optional: 3D view
-    import plotly.graph_objects as go
-    from skimage import measure
-    HAVE_3D = True
-except Exception:
-    HAVE_3D = False
 
 OUT_DIR = os.path.abspath("demo_out")   # downloadable reports (git-ignored)
 
@@ -147,71 +135,6 @@ def model_input_grid(vol, tile: int = 104):
         for j in range(4):
             canvas.paste(tiles[4 * c + j], (x0 + j * (tile + gap), y0 + band))
     return np.asarray(canvas)
-
-
-def _largest_component(mask):
-    lab, n = ndimage.label(mask)
-    if n == 0:
-        return mask
-    sizes = np.bincount(lab.ravel())
-    sizes[0] = 0
-    return lab == sizes.argmax()
-
-
-def _mesh(mask, spacing, sigma, step):
-    smooth = ndimage.gaussian_filter(mask.astype(np.float32), sigma)
-    verts, faces, _, _ = measure.marching_cubes(smooth, 0.5, spacing=spacing, step_size=step)
-    return np.round(verts, 1), faces
-
-
-def build_3d(vol, zooms):
-    """
-    Interactive 3D model of the scan: the body surface (translucent) and
-    structures brighter than 250 HU (bone, plus contrast-filled vessels and
-    kidneys). Built at about 3 mm resolution so it is quick to compute and draw.
-    """
-    sx = max(1, int(3.0 // zooms[0]))
-    sz = max(1, int(3.0 // zooms[2]))
-    small = vol[::sx, ::sx, ::sz]
-    spacing = (zooms[0] * sx, zooms[1] * sx, zooms[2] * sz)
-
-    body = small > -500
-    for z in range(body.shape[2]):                  # fill lungs / bowel gas per slice
-        body[:, :, z] = ndimage.binary_fill_holes(body[:, :, z])
-    body = _largest_component(body)                 # drops the CT table
-
-    dense = (small > 250) & ndimage.binary_dilation(body, iterations=2)
-    lab, n = ndimage.label(dense)
-    if n:
-        sizes = np.bincount(lab.ravel())
-        keep = sizes >= 40
-        keep[0] = False
-        dense = keep[lab]
-
-    fig = go.Figure()
-    light = dict(ambient=0.45, diffuse=0.85, specular=0.35, roughness=0.5, fresnel=0.2)
-    if body.any():
-        v, f = _mesh(body, spacing, 1.0, 2)
-        fig.add_trace(go.Mesh3d(x=v[:, 0], y=v[:, 1], z=v[:, 2], i=f[:, 0], j=f[:, 1], k=f[:, 2],
-                                color="#f0b89a", opacity=0.16, name="Body surface",
-                                hoverinfo="skip", lighting=light, showlegend=True))
-    if dense.any():
-        step = 1 if dense.sum() < 250_000 else 2
-        v, f = _mesh(dense, spacing, 0.8, step)
-        fig.add_trace(go.Mesh3d(x=v[:, 0], y=v[:, 1], z=v[:, 2], i=f[:, 0], j=f[:, 1], k=f[:, 2],
-                                color="#f5efe0", opacity=1.0, name="Bone and contrast (> 250 HU)",
-                                hoverinfo="skip", lighting=light, showlegend=True))
-    hidden = dict(visible=False, showbackground=False)
-    fig.update_layout(
-        height=640, margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        scene=dict(xaxis=hidden, yaxis=hidden, zaxis=hidden, aspectmode="data",
-                   bgcolor="rgba(0,0,0,0)",
-                   camera=dict(eye=dict(x=0.0, y=1.9, z=0.35), up=dict(x=0, y=0, z=1))),
-        legend=dict(x=0.01, y=0.99, font=dict(color="#94a3b8", size=13),
-                    bgcolor="rgba(0,0,0,0)"),
-    )
-    return fig
 
 
 # =============================================================================
@@ -449,7 +372,7 @@ def build_app(engine, scans, refs):
 
     # ---- callbacks -----------------------------------------------------------
     def load_scan(path):
-        """Generator: show the 2D views at once, then the 3D model."""
+        """Read the scan and fill the slice browser and the model-input grid."""
         if not path:
             raise gr.Error("Please upload a CT scan first.")
         path = str(path)
@@ -467,26 +390,12 @@ def build_app(engine, scans, refs):
             ("Size", f"{X} x {Y} x {Z} voxels"),
             ("Voxel size", f"{zooms[0]:.2f} x {zooms[1]:.2f} x {zooms[2]:.2f} mm"),
             ("Coverage", f"{Z * zooms[2] / 10:.1f} cm head-to-feet"),
-        ]) + '<div class="scroll-hint">Scan loaded. Scroll down to explore it in 3D and 2D &darr;</div>'
+        ]) + '<div class="scroll-hint">Scan loaded. Scroll down to explore it slice by slice &darr;</div>'
         slice_img, slice_cap = render_slice(vol, zooms, "Axial", 50)
         grid = model_input_grid(vol)
-        note_3d = ('<p class="caption">Building the 3D model ... a few seconds.</p>' if HAVE_3D else
-                   '<p class="caption">3D view unavailable: install <code>plotly</code> and '
-                   '<code>scikit-image</code>.</p>')
-        yield (path, info, gr.update(visible=True), None, note_3d,
-               "Axial", 50, slice_img, slice_cap, grid,
-               "", "", None, "")
-        if HAVE_3D:
-            try:
-                fig = build_3d(vol, zooms)
-                note_3d = ('<p class="caption">Drag to rotate, scroll to zoom. Translucent: body '
-                           'surface. Solid: bone, plus contrast-filled vessels and kidneys '
-                           '(&gt; 250 HU). Built at about 3 mm resolution for speed.</p>')
-            except Exception as e:
-                fig, note_3d = None, f'<p class="caption">Could not build the 3D view: {html.escape(str(e))}</p>'
-            yield (gr.update(), gr.update(), gr.update(), fig, note_3d,
-                   gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-                   gr.update(), gr.update(), gr.update(), gr.update())
+        return (path, info, gr.update(visible=True),
+                "Axial", 50, slice_img, slice_cap, grid,
+                "", "", None, "")
 
     def on_slice(path, plane, pos):
         if not path:
@@ -573,14 +482,8 @@ def build_app(engine, scans, refs):
         scan_info = gr.HTML()
 
         with gr.Column(visible=False) as results_col:
-            # 2. 3D view
-            gr.HTML(section_head(2, "3D view", "The whole scan as a 3D model. "
-                                 "Drag to rotate, scroll to zoom."))
-            plot3d = gr.Plot(show_label=False)
-            note3d = gr.HTML()
-
-            # 3. 2D slices
-            gr.HTML(section_head(3, "2D slices", "Browse the scan slice by slice in any of "
+            # 2. 2D slices
+            gr.HTML(section_head(2, "2D slices", "Browse the scan slice by slice in any of "
                                  "the three standard planes (patient's right is on your left)."))
             with gr.Row():
                 with gr.Column(scale=1, min_width=240):
@@ -592,8 +495,8 @@ def build_app(engine, scans, refs):
                     slice_img = gr.Image(show_label=False, type="numpy", interactive=False,
                                          height=540)
 
-            # 4. What the model sees
-            gr.HTML(section_head(4, "What the model sees",
+            # 3. What the model sees
+            gr.HTML(section_head(3, "What the model sees",
                                  "The scan becomes 64 slices. SATT averages every 4 neighbouring "
                                  "slices into one chunk (16 chunks) and a Transformer relates the "
                                  "chunks to each other before the language model reads them."))
@@ -601,8 +504,8 @@ def build_app(engine, scans, refs):
             gr.HTML('<p class="caption">Illustration of the model input; most superior slice first. '
                     'The model\'s own preprocessing resamples the scan with cubic interpolation.</p>')
 
-            # 5. Generate
-            gr.HTML(section_head(5, "Generate the report",
+            # 4. Generate
+            gr.HTML(section_head(4, "Generate the report",
                                  "Runs the full SATT pipeline on this scan on the laptop GPU."))
             gen_btn = gr.Button("Generate report", variant="primary", elem_id="generate-btn")
             status = gr.HTML()
@@ -613,15 +516,15 @@ def build_app(engine, scans, refs):
                               open=False):
                 ref_out = gr.HTML()
 
-        # 6. How it works
-        gr.HTML(section_head(6, "How SATT works", "From voxels to words in four stages."))
+        # 5. How it works
+        gr.HTML(section_head(5, "How SATT works", "From voxels to words in four stages."))
         gr.HTML(PIPELINE)
         gr.Markdown(RESULTS_MD)
         gr.HTML('<div class="footer">SATT &middot; Slice-Aware Temporal Tokenization for 3D CT '
                 'report generation &middot; Research prototype, not for clinical use</div>')
 
         # ---- events ----------------------------------------------------------
-        load_outs = [cur_path, scan_info, results_col, plot3d, note3d,
+        load_outs = [cur_path, scan_info, results_col,
                      plane, pos, slice_img, slice_cap, grid_img,
                      status, report_out, dl_file, ref_out]
         upload.upload(load_scan, upload, load_outs)
@@ -655,7 +558,6 @@ def main():
         refs = {str(r["study_id"]): {"reference": r["reference"], "prediction": r["prediction"]}
                 for _, r in df.iterrows()}
         print(f"[app] {len(refs)} reference reports from {args.refs}")
-    print(f"[app] 3D view {'enabled' if HAVE_3D else 'DISABLED (pip install plotly scikit-image)'}")
 
     engine = SATTInference(checkpoint_dir=args.checkpoint_dir, variant="satt_chunk4")
     demo, launch_kwargs = build_app(engine, scans, refs)
